@@ -30,6 +30,9 @@ fi
 # Disable filename expansion (globbing)
 set -o noglob
 
+# Set strict umask for temp files
+umask 077
+
 # Allowed directories (configurable via env var with fallback)
 ALLOWED_DIRS_ENV="${ALLOWED_DIRS_ENV:-}"
 if [ -n "$ALLOWED_DIRS_ENV" ]; then
@@ -60,6 +63,40 @@ command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
 
+# Check for required commands with fallbacks
+check_dependencies() {
+	local required=("git" "xclip" "mktemp" "stat" "file" "realpath")
+	for cmd in "${required[@]}"; do
+		if ! command_exists "$cmd"; then
+			case "$cmd" in
+			realpath)
+				if command_exists readlink; then
+					>&2 echo "Warning: Using 'readlink -f' as fallback for 'realpath'."
+				else
+					>&2 echo "Error: 'realpath' or 'readlink' required."
+					exit 1
+				fi
+				;;
+			stat)
+				if command_exists wc; then
+					>&2 echo "Warning: Using 'wc -c' as fallback for 'stat -c%s'."
+				else
+					>&2 echo "Error: 'stat' or 'wc' required for file size."
+					exit 1
+				fi
+				;;
+			file)
+				>&2 echo "Warning: 'file' command missing; falling back to extension-based binary check (less accurate)."
+				;;
+			*)
+				>&2 echo "Error: Required command '$cmd' is missing."
+				exit 1
+				;;
+			esac
+		fi
+	done
+}
+
 # Ensure xclip is installed
 ensure_xclip() {
 	if ! command_exists xclip; then
@@ -78,7 +115,7 @@ Copy the paths and contents of files to the clipboard.
 Options:
   -h, --help             Display this help and exit
   --include-hidden       Include hidden files (e.g., .<name>) in the output
-  --include-content      Include file contents in the console output (for debugging)
+  --verbose, -v          Enable verbose debugging output
   --from-clipboard       Read the list of file paths from the clipboard
   --copy-to-file, -ctf   Write the gathered content to a temporary file and copy the file reference to clipboard
 
@@ -113,8 +150,10 @@ sanitize_clipboard_content() {
 	for line in "${file_list[@]}"; do
 		# Remove non-printable characters
 		line=$(echo "$line" | tr -cd '\11\12\15\40-\176')
+		# Whitelist allowed path characters to prevent injections
+		line=$(echo "$line" | sed 's/[^a-zA-Z0-9_./-]//g')
 		# Skip if line exceeds max length
-		if [ "${#line}" -gt "$MAX_LINE_LENGTH" ]; then
+		if ((${#line} > MAX_LINE_LENGTH)); then
 			>&2 echo "Warning: Skipping overly long clipboard line: ${line:0:50}..."
 			continue
 		fi
@@ -132,21 +171,39 @@ validate_path() {
 		return 1
 	fi
 
-	# Convert to absolute path
-	path=$(realpath "$path" 2>/dev/null)
+	# Determine resolution command
+	local resolve_cmd
+	if command_exists realpath; then
+		resolve_cmd="realpath -e"
+	else
+		resolve_cmd="readlink -f"
+	fi
+
+	# Resolve path (suppress exit on failure)
+	path=$($resolve_cmd "$path" 2>/dev/null) || true
 	if [ -z "$path" ]; then
-		>&2 echo "Warning: Could not resolve path '$path'. Skipping."
+		>&2 echo "Warning: Could not resolve or path does not exist: '$1'. Skipping."
 		return 1
 	fi
 
+	# Canonicalize allowed dirs for accurate comparison
+	local canon_allowed=()
+	for dir in "${ALLOWED_DIRS[@]}"; do
+		local canon_dir
+		canon_dir=$($resolve_cmd "$dir" 2>/dev/null) || true
+		if [ -n "$canon_dir" ]; then
+			canon_allowed+=("$canon_dir")
+		fi
+	done
+
 	local is_valid=0
-	for allowed_dir in "${ALLOWED_DIRS[@]}"; do
-		if [[ "$path" == "$allowed_dir"* ]]; then
+	for allowed in "${canon_allowed[@]}"; do
+		if [[ "$path" == "$allowed"* ]]; then
 			is_valid=1
 			break
 		fi
 	done
-	if [ "$is_valid" -eq 0 ]; then
+	if ((is_valid == 0)); then
 		>&2 echo "Warning: '$path' is not in the list of allowed directories."
 		return 1
 	fi
@@ -165,8 +222,8 @@ validate_file_paths() {
 		fi
 
 		local resolved_path
-		resolved_path=$(validate_path "$file_path")
-		if [ $? -ne 0 ]; then
+		resolved_path=$(validate_path "$file_path") || true
+		if [ -z "$resolved_path" ]; then
 			continue
 		fi
 
@@ -188,7 +245,7 @@ get_file_list() {
 	local args=("$@")
 	local file_list=()
 
-	if [ "$from_clipboard" -eq 1 ]; then
+	if ((from_clipboard == 1)); then
 		# Read file paths from the clipboard
 		if ! command_exists xclip; then
 			>&2 echo "Error: xclip is required to read from the clipboard."
@@ -200,29 +257,29 @@ get_file_list() {
 		sanitize_clipboard_content
 
 		# Limit number of files
-		if [ "${#file_list[@]}" -gt "$MAX_FILES" ]; then
+		if ((${#file_list[@]} > MAX_FILES)); then
 			>&2 echo "Error: Too many files in clipboard. Maximum allowed is $MAX_FILES."
 			exit 1
 		fi
 
-	elif [ "${#args[@]}" -gt 0 ]; then
+	elif ((${#args[@]} > 0)); then
 		# Use file paths provided as arguments
 		file_list=("${args[@]}")
 	elif [ -n "$repo_path" ]; then
 		# Validate repo_path first
 		local validated_repo
-		validated_repo=$(validate_path "$repo_path")
-		if [ $? -ne 0 ]; then
+		validated_repo=$(validate_path "$repo_path") || true
+		if [ -z "$validated_repo" ]; then
 			>&2 echo "Error: Invalid repository path."
 			exit 1
 		fi
 		repo_path="$validated_repo"
 
 		# Get tracked files from the Git repository
-		if [ "$include_hidden" -eq 1 ]; then
-			mapfile -t file_list < <(git -C "$repo_path" ls-files)
+		if ((include_hidden == 1)); then
+			mapfile -t file_list < <(git -C "$repo_path" ls-files --)
 		else
-			mapfile -t file_list < <(git -C "$repo_path" ls-files | grep -v '^\.')
+			mapfile -t file_list < <(git -C "$repo_path" ls-files -- | grep -v '^\.')
 		fi
 		# Prepend repo_path to each file
 		for i in "${!file_list[@]}"; do
@@ -259,7 +316,7 @@ copy_file_to_clipboard() {
 # Function to process files
 process_files() {
 	local copy_to_file="$1"
-	local include_content="$2"
+	local verbose="$2"
 	local repo_path="$3"
 	shift 3
 	local file_paths=("$@")
@@ -289,15 +346,19 @@ process_files() {
 
 		# Check file size
 		local file_size
-		file_size=$(stat -c%s "$file_path")
+		if command_exists stat; then
+			file_size=$(stat -c%s "$file_path")
+		else
+			file_size=$(<"$file_path" wc -c)
+		fi
 
 		# Check if file is empty (0 bytes)
-		if [ "$file_size" -eq 0 ]; then
+		if ((file_size == 0)); then
 			empty_files+=("$file_path")
 			continue
 		fi
 
-		if [ "$file_size" -gt "$MAX_FILE_SIZE" ]; then
+		if ((file_size > MAX_FILE_SIZE)); then
 			output+="< $(printf '%q' "$file_path") >"$'\n'"\`\`\`"$'\n'"File too large to process"$'\n'"\`\`\`"$'\n\n'
 			copied_paths+=("$file_path")
 			continue
@@ -305,7 +366,20 @@ process_files() {
 
 		# Skip actual binaries, but allow common text formats like JSON/Lua (even if misdetected as JS)
 		local mime_type
-		mime_type=$(file --mime-type -b "$file_path")
+		if command_exists file; then
+			mime_type=$(file --mime-type -b "$file_path")
+		else
+			# Fallback to extension-based check (basic)
+			local ext="${file_path##*.}"
+			case "$ext" in
+			txt | md | sh | py | js | json | lua | yaml | xml | csv)
+				mime_type="text/plain"
+				;;
+			*)
+				mime_type="application/octet-stream" # Assume binary
+				;;
+			esac
+		fi
 		local ext="${file_path##*.}"
 		if [[ $mime_type != text/* && $mime_type != application/json && ($mime_type != application/javascript || $ext != "lua") ]]; then
 			>&2 echo "Skipping binary file: $file_path (MIME: $mime_type)"
@@ -314,10 +388,6 @@ process_files() {
 
 		local content
 		if content=$(<"$file_path"); then
-			if [ "${#content}" -ne "$file_size" ]; then
-				>&2 echo "Warning: File truncated (possible null bytes): $file_path"
-				continue
-			fi
 			# Check for null bytes
 			if printf '%s' "$content" | grep -qP '\x00'; then
 				>&2 echo "Warning: Null byte found and removed in file: $file_path"
@@ -336,7 +406,7 @@ process_files() {
 	done
 
 	# Add empty files list to clipboard output
-	if [ "${#empty_files[@]}" -gt 0 ]; then
+	if ((${#empty_files[@]} > 0)); then
 		output+="# Empty Files (0 bytes)"$'\n\n'
 		for empty_file in "${empty_files[@]}"; do
 			output+="- $empty_file"$'\n'
@@ -345,39 +415,37 @@ process_files() {
 		output+=$'\n'
 	fi
 
-	if [ -z "$output" ] && [ "${#empty_files[@]}" -eq 0 ]; then
+	if [ -z "$output" ] && ((${#empty_files[@]} == 0)); then
 		>&2 echo "No files to process."
 	else
-		if [ "$include_content" -eq 1 ]; then
-			echo "Debugging output:"
+		if ((verbose == 1)); then
+			echo "Verbose debugging output:"
 			printf '%s\n' "$output"
+			echo "Debug: Processed ${#file_paths[@]} files."
 		fi
-		if [ "$copy_to_file" -eq 1 ]; then
-			local project_name
-			if [ -n "$repo_path" ]; then
-				project_name=$(basename "$repo_path")
-			else
-				project_name=$(basename "$(pwd)")
-			fi
+		if ((copy_to_file == 1)); then
+			local temp_dir="$HOME/.grabfiles_tmp"
+			mkdir -p "$temp_dir" # Create if not exists
 			local temp_file
-			temp_file=$(mktemp /tmp/"${project_name}"_grabfiles_output.XXXXXX.md)
+			temp_file=$(mktemp "$temp_dir/grabfiles_output.XXXXXX.md") # No user-controlled prefix
 			printf '%s' "$output" >"$temp_file"
 			copy_file_to_clipboard "$temp_file"
 			if command_exists clipnotify; then
 				(clipnotify && rm -f "$temp_file") &
+			else
+				>&2 echo "Warning: clipnotify not installed; temp file will auto-delete after 5 minutes."
+				(sleep 300 && rm -f "$temp_file") &
 			fi
 			echo "The output has been written to $temp_file and its reference copied to your clipboard."
-			if ! command_exists clipnotify; then
-				echo "Note: Install clipnotify (from https://github.com/cdown/clipnotify) for auto-deletion when the clipboard is overwritten."
-			fi
+			echo "Note: Temp file will be deleted automatically (via clipnotify or timeout)."
 		else
 			printf '%s' "$output" | xclip -selection clipboard
 			echo "The file paths and contents have been copied to your clipboard."
 		fi
-		if [ "${#empty_files[@]}" -gt 0 ]; then
+		if ((${#empty_files[@]} > 0)); then
 			>&2 echo "Note: ${#empty_files[@]} empty file(s) added to clipboard output."
 		fi
-		if [ "${#copied_paths[@]}" -gt 0 ]; then
+		if ((${#copied_paths[@]} > 0)); then
 			echo "Paths of copied files:"
 			for path in "${copied_paths[@]}"; do
 				echo "$path"
@@ -388,9 +456,15 @@ process_files() {
 
 main() {
 	ensure_xclip
+	check_dependencies
+
+	if [ "$(id -u)" -eq 0 ]; then
+		>&2 echo "Error: Do not run this script as root."
+		exit 1
+	fi
 
 	local INCLUDE_HIDDEN=0
-	local INCLUDE_CONTENT=0
+	local VERBOSE=0
 	local FROM_CLIPBOARD=0
 	local COPY_TO_FILE=0
 	local repo_path=""
@@ -405,8 +479,8 @@ main() {
 			INCLUDE_HIDDEN=1
 			shift
 			;;
-		--include-content)
-			INCLUDE_CONTENT=1
+		--verbose | -v)
+			VERBOSE=1
 			shift
 			;;
 		--from-clipboard)
@@ -424,14 +498,14 @@ main() {
 		esac
 	done
 
-	if [ "$FROM_CLIPBOARD" -eq 0 ] && [ "${#positional_args[@]}" -eq 0 ]; then
+	if ((FROM_CLIPBOARD == 0)) && ((${#positional_args[@]} == 0)); then
 		>&2 echo "Error: No file paths or repository path provided."
 		>&2 echo "Try '$0 --help' for more information."
 		exit 1
 	fi
 
 	local file_list=()
-	if [ "$FROM_CLIPBOARD" -eq 1 ]; then
+	if ((FROM_CLIPBOARD == 1)); then
 		mapfile -t file_list < <(get_file_list "$FROM_CLIPBOARD" "$INCLUDE_HIDDEN" "" "${positional_args[@]}")
 	elif [ -d "${positional_args[0]}" ] && [ -d "${positional_args[0]}/.git" ]; then
 		repo_path="${positional_args[0]}"
@@ -443,12 +517,12 @@ main() {
 	# Validate the file paths
 	mapfile -t valid_file_paths < <(validate_file_paths "${file_list[@]}")
 
-	if [ "${#valid_file_paths[@]}" -eq 0 ]; then
+	if ((${#valid_file_paths[@]} == 0)); then
 		>&2 echo "No valid files to process."
 		exit 1
 	fi
 
-	process_files "$COPY_TO_FILE" "$INCLUDE_CONTENT" "$repo_path" "${valid_file_paths[@]}"
+	process_files "$COPY_TO_FILE" "$VERBOSE" "$repo_path" "${valid_file_paths[@]}"
 }
 
 main "$@"
