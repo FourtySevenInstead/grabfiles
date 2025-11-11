@@ -35,6 +35,7 @@ umask 077
 
 # Allowed directories (configurable via env var with fallback)
 ALLOWED_DIRS_ENV="${ALLOWED_DIRS_ENV:-}"
+# TODO: Harden environment variable trust, e.g., require opt-in.
 if [ -n "$ALLOWED_DIRS_ENV" ]; then
 	IFS=':' read -r -a ALLOWED_DIRS <<<"$ALLOWED_DIRS_ENV"
 else
@@ -150,8 +151,8 @@ sanitize_clipboard_content() {
 	for line in "${file_list[@]}"; do
 		# Remove non-printable characters
 		line=$(echo "$line" | tr -cd '\11\12\15\40-\176')
-		# Whitelist allowed path characters to prevent injections
-		line=$(echo "$line" | sed 's/[^a-zA-Z0-9_./-]//g')
+		# Whitelist reasonable path characters to prevent injections
+		line=$(echo "$line" | sed 's/[^a-zA-Z0-9_./ -()[\]{}@+=,#%]//g')
 		# Skip if line exceeds max length
 		if ((${#line} > MAX_LINE_LENGTH)); then
 			>&2 echo "Warning: Skipping overly long clipboard line: ${line:0:50}..."
@@ -370,6 +371,7 @@ process_files() {
 			mime_type=$(file --mime-type -b "$file_path")
 		else
 			# Fallback to extension-based check (basic)
+			# TODO: Enhance fallback with more accurate binary detection.
 			local ext="${file_path##*.}"
 			case "$ext" in
 			txt | md | sh | py | js | json | lua | yaml | xml | csv)
@@ -426,6 +428,7 @@ process_files() {
 		if ((copy_to_file == 1)); then
 			local temp_dir="$HOME/.grabfiles_tmp"
 			mkdir -p "$temp_dir" # Create if not exists
+			chmod 700 "$temp_dir"
 			local temp_file
 			temp_file=$(mktemp "$temp_dir/grabfiles_output.XXXXXX.md") # No user-controlled prefix
 			printf '%s' "$output" >"$temp_file"
@@ -524,5 +527,7 @@ main() {
 
 	process_files "$COPY_TO_FILE" "$VERBOSE" "$repo_path" "${valid_file_paths[@]}"
 }
+
+# TODO: Improve support for Zsh and other shells.
 
 main "$@"
